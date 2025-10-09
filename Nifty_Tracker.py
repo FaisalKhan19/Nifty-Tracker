@@ -100,7 +100,7 @@ class Tracker:
             "strType": "C",
             "subcategory": subCat
         }
-        
+
         if test:
             params.pop('strScrip')
         session.params.update(params)
@@ -284,21 +284,21 @@ def getReport(url, quarter=None):
             f.write(res.content)
 
 def fetch_historical_quarterly():
-    os.makedirs('QuarterlyResults')
+    os.makedirs('QuarterlyResults', exist_ok=True)
     df = pd.read_csv("data/tracking_list.csv")
-    df = df[:5]
+    df = df[df['Security Code']==541450]
     # Last 10 quarter end dates (most recent first, ending 30-Jun-2025)
     quarter_ends = [
-        # "2025-06-30",
-        "2025-03-31",
-        "2024-12-31",
-        "2024-09-30",
-        "2024-06-30",
-        "2024-03-31",
-        "2023-12-31",
-        "2023-09-30",
-        # "2023-06-30",
-        # "2023-03-31"
+        "2025-06-30",
+        # "2025-03-31",
+        # "2024-12-31",
+        # "2024-09-30",
+        # "2024-06-30",
+        # "2024-03-31",
+        # "2023-12-31",
+        # "2023-09-30",
+        # # "2023-06-30",
+        # # "2023-03-31"
     ]
 
     # Convert to datetime
@@ -311,20 +311,20 @@ def fetch_historical_quarterly():
         bot = Bot(config_path='.ini')
         start = q_end + timedelta(days=1)
         end = start + timedelta(days=30)
-        start1 = end + timedelta(days=1)
-        end1 = start1 + timedelta(days=14)   # 45 days inclusive
+        # start1 = end + timedelta(days=1)
+        # end1 = start1 + timedelta(days=14)   # 45 days inclusive
         
         prev = tracker.format_date(start)
         to = tracker.format_date(end)
-        prev1 = tracker.format_date(start1)
-        to1 = tracker.format_date(end1)
+        # prev1 = tracker.format_date(start1)
+        # to1 = tracker.format_date(end1)
 
-        tracker.build_set(df, prev, to)
-        tracker.build_set(df, prev1, to1)
+        tracker.build_set(df, '20250701', '20250730')
+        # tracker.build_set(df, prev1, to1)
 
         _, fetched = tracker.getProcessed()
         fetched = fetched.drop_duplicates(subset=['company'])
-        fetched.to_csv(os.path.join('QuarterlyResults', f"{tracker.format_date(q_end)}_announcements"))
+        fetched.to_csv(os.path.join('QuarterlyResults', f"{tracker.format_date(q_end)}_announcements.csv"))
         if not fetched.empty:
             for _, row in fetched.iterrows():
                 url = row['file_url']
@@ -363,13 +363,13 @@ def main():
             extracted_data = bot.buildNumbers(data=new_data)
             extracted_data.to_csv(save_path, index=False)
 
-            # Build message only for new announcements
-            new_message = ""
-            for _, row in new_data.iterrows():
-                new_message += f"🏢 {row['company']}\n📢 {row['headline']}\n⏰ {row['time']}\n🔗 {row['file_url']}\n\n"
+            # # Build message only for new announcements
+            # new_message = ""
+            # for _, row in new_data.iterrows():
+            #     new_message += f"🏢 {row['company']}\n📢 {row['headline']}\n⏰ {row['time']}\n🔗 {row['file_url']}\n\n"
 
-            if new_message:
-                bot.send_messages(new_message, save_path)
+            # if new_message:
+            #     bot.send_messages(new_message, save_path)
 
             # Mark as processed for today and persist
             tracker.processed_ids.update(new_data['id'].tolist())
