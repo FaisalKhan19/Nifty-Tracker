@@ -51,7 +51,7 @@ class Tracker:
         except Exception:
             pass
 
-    def getAnnouncements(self, code: int, prevDate: str = None, toDate: str = None, test: bool = False):
+    def getAnnouncements(self, code: int, prevDate: str = None, toDate: str = None, test: bool = False, **kwargs):
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
             "Accept": "application/json, text/plain, */*",
@@ -87,16 +87,20 @@ class Tracker:
                 prev_date_obj = to_date_obj - timedelta(days=1)
                 strPrevDate_val = prev_date_obj.strftime("%Y%m%d")
 
+        cat = kwargs.get('cat', 'Result')
+        subCat = kwargs.get('subCat','Financial Results')
+
         params = {
             "pageno": 1,
-            "strCat": "Result",
+            "strCat": cat,
             "strPrevDate": strPrevDate_val,
             "strScrip": str(code),
             "strSearch": "P",
             "strToDate": strToDate_val,
             "strType": "C",
-            "subcategory": "Financial Results"
+            "subcategory": subCat
         }
+        
         if test:
             params.pop('strScrip')
         session.params.update(params)
@@ -145,7 +149,7 @@ class Bot:
         self.config.read(config_path)
         self.client = OpenAI()
         self.page_filter = re.compile(r"(financial\s+highlights|results|profit|revenue|PAT|Profit After Tax|EBITDA|EPS)", re.IGNORECASE)
-        with open("subscribers.json", "r") as f:
+        with open("data/subscribers.json", "r") as f:
             content = f.read().strip()
         self.mailing_list = set(json.loads(content))
         self.min_delay_between_calls = float(os.getenv("OPENAI_MIN_DELAY", "0.4"))
@@ -281,7 +285,7 @@ def getReport(url, quarter=None):
 
 def fetch_historical_quarterly():
     os.makedirs('QuarterlyResults')
-    df = pd.read_csv("tracking_list.csv")
+    df = pd.read_csv("data/tracking_list.csv")
     df = df[:5]
     # Last 10 quarter end dates (most recent first, ending 30-Jun-2025)
     quarter_ends = [
@@ -319,14 +323,15 @@ def fetch_historical_quarterly():
         tracker.build_set(df, prev1, to1)
 
         _, fetched = tracker.getProcessed()
+        fetched = fetched.drop_duplicates(subset=['company'])
         fetched.to_csv(os.path.join('QuarterlyResults', f"{tracker.format_date(q_end)}_announcements"))
         if not fetched.empty:
             for _, row in fetched.iterrows():
                 url = row['file_url']
                 getReport(url, tracker.format_date(q_end))
 
-            extracted = bot.buildNumbers(fetched)
-            extracted.to_csv(os.path.join('QuarterlyResults', tracker.format_date(q_end)), index=False)
+            # extracted = bot.buildNumbers(fetched)
+            # extracted.to_csv(os.path.join('QuarterlyResults', tracker.format_date(q_end)), index=False)
 
 
 def main():
@@ -379,4 +384,4 @@ def main():
 
         break
 if __name__ == '__main__':
-    main()
+    fetch_historical_quarterly()

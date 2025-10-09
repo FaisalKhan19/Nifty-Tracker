@@ -5,3 +5,13 @@ NSE__Weekly.db
 /hmm_training_results/
 .env
 .ini
+/OB_plots/
+/OB_plots_v1/
+/plots/
+/plots_data/
+/QuarterlyResults/
+/hourly_data/
+/env/
+/Coc_OB/
+/daily_data_nse/
+/__pycache__/
