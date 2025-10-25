@@ -10,6 +10,7 @@ import pdfplumber
 import re
 import dotenv
 from tqdm import tqdm
+import pymupdf4llm
 dotenv.load_dotenv()
 
 class Tracker:
@@ -148,124 +149,198 @@ class Bot:
         self.config = configparser.ConfigParser()
         self.config.read(config_path)
         self.client = OpenAI()
-        self.page_filter = re.compile(r"(financial\s+highlights|results|profit|revenue|PAT|Profit After Tax|EBITDA|EPS)", re.IGNORECASE)
         with open("data/subscribers.json", "r") as f:
-            content = f.read().strip()
-        self.mailing_list = set(json.loads(content))
+            self.mailing_list = set(json.loads(f.read().strip()))
         self.min_delay_between_calls = float(os.getenv("OPENAI_MIN_DELAY", "0.4"))
         self._last_openai_call_ts = 0.0
 
+        ## Keywords to identify relevant financial pages
+        self.page_filter = re.compile(
+            r"("
+            r"financial\s+highlights|"
+            r"results?|quarterly\s+performance|summary\s+of\s+results?|"
+            r"profit\s*(after|before)?\s*(tax|provisions)?|"
+            r"revenue|income\s+from\s+operations|total\s+income|"
+            r"interest\s+(income|earned)|finance\s+costs?|"
+            r"expenses?|operating\s+expenditure|opex|"
+            r"ebitda|ebit|pbt|pat|net\s+profit|loss|"
+            r"earnings\s+per\s+share|eps|"
+            r"loans?\s+(and\s+advances|book|portfolio|outstanding)|"
+            r"advances?|aum|assets?\s+under\s+management|"
+            r"borrowings?|deposits?|capital\s+adequacy|car\b|"
+            r"tier\s*1|tier\s*i|crar|"
+            r"provisions?|expected\s+credit\s+loss|ecl|impairment|"
+            r"gross\s+npas?|net\s+npas?|gnpa|nnpa|"
+            r"disbursements?|collections?|liabilities?|balance\s+sheet|"
+            r"ratios?|financial\s+ratios?|"
+            r"employee\s+benefits?|staff\s+cost|personnel\s+expenses|"
+            r"other\s+expenses|overheads?"
+            r")",
+            re.IGNORECASE
+        )
+
+
+    # --- TEXT EXTRACTION ---
     def extract_pages(self, pdf_path):
+        """Extract all text from PDF pages using pdfplumber."""
         pages_text = []
         with pdfplumber.open(pdf_path) as pdf:
             for i, page in enumerate(pdf.pages):
-                text = page.extract_text()
-                if text:
-                    pages_text.append((i, text))
+                text = page.extract_text() or ""
+                # Skip empty or useless pages
+                if text.strip():
+                    pages_text.append((i, text.strip()))
         return pages_text
 
+    def extract_to_md(self, pdf_path):
+        md_text = pymupdf4llm.to_markdown(pdf_path)
+        return md_text
+    
     def filter_financial_pages(self, pages_text):
+        """Filter out pages unrelated to financial results."""
         return [(i, text) for i, text in pages_text if self.page_filter.search(text)]
 
+    # --- AI EXTRACTION ---
     def extract_with_ai(self, filtered_pages):
+        """Extract numeric KPIs from filtered text using GPT."""
         if not filtered_pages:
             return None
-        content = "\n\n".join([f"Page {i}:\n{text}" for i, text in filtered_pages])
+
+        # # Combine relevant text (limit to avoid context overflow)
+        # text_content = "\n\n".join(
+        #     [f"Page {i + 1}:\n{text}" for i, text in filtered_pages[:6]]
+        # )[:20000]
+
+        text_content = filtered_pages
 
         system_msg = (
-            "You extract numeric KPIs from financial result excerpts and must return a single valid JSON object only. "
-            "No prose, no markdown, no code fences."
-        )
-        user_msg = (
-            "Extract the following values if present from the latest quarter (numbers only, no units):\n"
-            "- Revenue\n- PAT (Profit After Tax)\n- EBITDA\n- EPS Basic\n- EPS Diluted\n- Operating Margin\n- Earnings\n\n"
-            "Return STRICT JSON only with these keys. If missing, set value to empty string.\n\n"
-            "Text:\n" + content
+            "You are a financial data extraction assistant. "
+            "Your task is to read text excerpts from quarterly financial reports "
+            "and extract or compute numerical KPIs accurately. "
+            "Return only a single valid JSON object with the requested fields. No prose, no code, no markdown."
         )
 
-        # Simple client-side rate limiter and retry with exponential backoff on 429s/timeouts
+        user_msg = (
+            "You are reading a quarterly financial report of an NBFC or financial institution.\n"
+            "Extract **numerical values only** (no units, %, ₹, or Cr) for the following keys "
+            "from the most recent quarter in the text:\n\n"
+            "1. 'Interest Income'\n"
+            "2. 'Finance Costs'\n"
+            "3. 'Provisions / ECL / Loan Losses'\n"
+            "4. 'Employee Benefits Expense'\n"
+            "5. 'Other Expenses'\n"
+            "6. 'EPS Basic'\n"
+            "7. 'EPS Diluted'\n"
+            "8. 'Loans to Customers'\n"
+            "9. 'CAR (%)'\n"
+            "10. 'Tier 1 Ratio (%)'\n\n"
+            "Rules:\n"
+            "- If not present, set value to empty string.\n"
+            "- Use only the **latest quarter**, not YTD or full year.\n"
+            "- Return strictly JSON with only those keys.\n"
+            "- Example:\n"
+            "{\n"
+            '  "Interest Income": "12345",\n'
+            '  "Finance Costs": "6789",\n'
+            '  "Provisions / ECL / Loan Losses": "123",\n'
+            '  "Employee Benefits Expense": "456",\n'
+            '  "Other Expenses": "789",\n'
+            '  "EPS Basic": "12.34",\n'
+            '  "EPS Diluted": "12.10",\n'
+            '  "Loans to Customers": "567890",\n'
+            '  "CAR (%)": "18.5",\n'
+            '  "Tier 1 Ratio (%)": "15.2"\n'
+            "}\n\n"
+            f"Text to extract from:\n{text_content}"
+        )
+
+        # --- Retry logic ---
         max_retries = 5
         backoff = 2.0
         for attempt in range(max_retries):
-            # Respect minimum spacing between OpenAI calls
             now = time.time()
             delay = self.min_delay_between_calls - (now - self._last_openai_call_ts)
             if delay > 0:
                 time.sleep(delay)
             try:
                 resp = self.client.chat.completions.create(
-                    model="gpt-4.1",
+                    model="gpt-4.1",  # use gpt-4o-mini or gpt-4.1 depending on access
                     messages=[
                         {"role": "system", "content": system_msg},
                         {"role": "user", "content": user_msg},
                     ],
-                    temperature=0,
+                    temperature=0.2,
                     response_format={"type": "json_object"},
-                    timeout=60,
+                    timeout=90,
                 )
                 self._last_openai_call_ts = time.time()
                 return resp.choices[0].message.content
             except Exception as e:
-                # Detect likely rate limit or transient errors
                 err_text = str(e).lower()
-                is_rate_limited = ("rate" in err_text or "429" in err_text)
-                is_retryable = is_rate_limited or "timeout" in err_text or "temporarily unavailable" in err_text or "service unavailable" in err_text
-                if attempt < max_retries - 1 and is_retryable:
-                    time.sleep(backoff)
-                    backoff = min(backoff * 2.0, 60.0)
-                    continue
+                if any(x in err_text for x in ["rate", "429", "timeout", "unavailable"]):
+                    if attempt < max_retries - 1:
+                        time.sleep(backoff)
+                        backoff = min(backoff * 2, 60)
+                        continue
+                print(f"❌ Extraction failed: {e}")
                 return None
 
+    # --- PIPELINE ---
     def buildNumbers(self, data: pd.DataFrame):
-        numbers = []
-        for _, row in tqdm(data.iterrows(), desc='Processing PDFs'):
-            pdf_path = os.path.join("PDFs", row['file_url'].split("=")[1])
-            pages_text = self.extract_pages(pdf_path)
-            filtered = self.filter_financial_pages(pages_text)
-            if not filtered:
+        results = []
+        for _, row in tqdm(data.iterrows(), total=len(data), desc="Processing PDFs"):
+            pdf_path = os.path.join("PDFs", row["file_url"].split("=")[1])
+            # pages_text = self.extract_pages(pdf_path)
+            # filtered = self.filter_financial_pages(pages_text)
+            md_text = self.extract_to_md(pdf_path)
+            ai_result = self.extract_with_ai(md_text)
+
+            if not ai_result:
                 continue
-            result = self.extract_with_ai(filtered)
+
             try:
-                if not result:
+                result = json.loads(ai_result)
+            except Exception:
+                # Handle malformed JSON by regex extraction
+                match = re.findall(r"\{[\s\S]*\}", ai_result)
+                if not match:
+                    print("Invalid JSON from model:", ai_result)
                     continue
-                try:
-                    result = json.loads(result)
-                except Exception:
-                    match = re.findall(r"\{[\s\S]*\}", result)
-                    if not match:
-                        raise
-                    result = json.loads(match[-1])
-                result.update({'company': row['company']})
-                result.update({'date': row['time']})
-                result.update({'sec_code': row['sec_code']})
-                result.update({'file_url': row['file_url']})
-                numbers.append(result)
-            except Exception as e:
-                print("Error occured while processing PDF:", e)
-                print(result)
-                continue
-        if not numbers:
-            return pd.DataFrame(columns=['company', 'date', 'sec_code', 'Revenue', 'PAT', 'EBITDA', 'EPS Basic', 'EPS Diluted', 'Operating Margin', 'Earnings', 'file_url'])
-        df = pd.DataFrame(numbers)
-        cols = [c for c in ['company', 'date', 'sec_code', 'Revenue', 'PAT', 'EBITDA', 'EPS Basic', 'EPS Diluted', 'Operating Margin', 'Earnings', 'file_url'] if c in df.columns]
-        return df[cols]
-    
+                result = json.loads(match[-1])
+
+            result.update({
+                "company": row["company"],
+                "date": row["time"],
+                "sec_code": row["sec_code"],
+                "file_url": row["file_url"],
+            })
+            results.append(result)
+
+        # Build final dataframe
+        cols = [
+            "company", "date", "sec_code",
+            "Interest Income", "Finance Costs", "Provisions / ECL / Loan Losses",
+            "Employee Benefits Expense", "Other Expenses",
+            "EPS Basic", "EPS Diluted", "Loans to Customers",
+            "CAR (%)", "Tier 1 Ratio (%)", "file_url"
+        ]
+        return pd.DataFrame(results, columns=cols)
+
+    # --- TELEGRAM SENDER ---
     def send_messages(self, message, data_path):
-        BOT_TOKEN = self.config['Bot']['Token']
+        BOT_TOKEN = self.config["Bot"]["Token"]
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument"
-        msg_url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
         with open(data_path, "rb") as f:
             for chat_id in self.mailing_list:
-                # res = requests.post(msg_url, data={"chat_id": chat_id, "text": message})
                 f.seek(0)
-                res = requests.post(
+                requests.post(
                     url,
                     data={
                         "chat_id": chat_id,
-                        "caption": "Extracted Numbers",
-                        "parse_mode": "Markdown"
+                        "caption": message,
+                        "parse_mode": "Markdown",
                     },
-                    files={"document": (os.path.basename(data_path), f, "text/csv")}
+                    files={"document": (os.path.basename(data_path), f, "text/csv")},
                 )
 
 def getReport(url, quarter=None):
@@ -275,30 +350,41 @@ def getReport(url, quarter=None):
     "Referer": "https://www.bseindia.com/",
     "Origin": "https://www.bseindia.com",
     }
-    os.makedirs(os.path.join("PDFs", quarter), exist_ok=True)
+    os.makedirs("PDFs", exist_ok=True)
     res = requests.get(url, headers=headers, timeout=20)
 
     if res.status_code == 200:
-        path = os.path.join("PDFs", quarter, url.split('=')[1])
+        path = os.path.join("PDFs", url.split('=')[1])
         with open(path, "wb") as f:
             f.write(res.content)
 
 def fetch_historical_quarterly():
-    os.makedirs('QuarterlyResults', exist_ok=True)
-    df = pd.read_csv("data/tracking_list.csv")
-    df = df[df['Security Code']==541450]
+    os.makedirs('NBFC_QuarterlyResults', exist_ok=True)
+    df = pd.read_excel("RequiredNBFCs.xlsx")
     # Last 10 quarter end dates (most recent first, ending 30-Jun-2025)
     quarter_ends = [
         "2025-06-30",
-        # "2025-03-31",
-        # "2024-12-31",
-        # "2024-09-30",
-        # "2024-06-30",
-        # "2024-03-31",
-        # "2023-12-31",
-        # "2023-09-30",
-        # # "2023-06-30",
-        # # "2023-03-31"
+        "2025-03-31",
+        "2024-12-31",
+        "2024-09-30",
+        "2024-06-30",
+        "2024-03-31",
+        "2023-12-31",
+        "2023-09-30",
+        "2023-06-30",
+        "2023-03-31",
+        "2022-12-31",
+        "2022-09-30",
+        "2022-06-30",
+        "2022-03-31",
+        "2021-12-31",
+        "2021-09-30",
+        "2021-06-30",
+        "2021-03-31",
+        "2020-12-31",
+        "2020-09-30",
+        "2020-06-30",
+        "2020-03-31"
     ]
 
     # Convert to datetime
@@ -311,27 +397,27 @@ def fetch_historical_quarterly():
         bot = Bot(config_path='.ini')
         start = q_end + timedelta(days=1)
         end = start + timedelta(days=30)
-        # start1 = end + timedelta(days=1)
-        # end1 = start1 + timedelta(days=14)   # 45 days inclusive
+        start1 = end + timedelta(days=1)
+        end1 = start1 + timedelta(days=14)   # 45 days inclusive
         
         prev = tracker.format_date(start)
         to = tracker.format_date(end)
-        # prev1 = tracker.format_date(start1)
-        # to1 = tracker.format_date(end1)
+        prev1 = tracker.format_date(start1)
+        to1 = tracker.format_date(end1)
 
-        tracker.build_set(df, '20250701', '20250730')
-        # tracker.build_set(df, prev1, to1)
+        tracker.build_set(df, prev, to)
+        tracker.build_set(df, prev1, to1)
 
         _, fetched = tracker.getProcessed()
         fetched = fetched.drop_duplicates(subset=['company'])
-        fetched.to_csv(os.path.join('QuarterlyResults', f"{tracker.format_date(q_end)}_announcements.csv"))
+        fetched.to_csv(os.path.join('NBFC_QuarterlyResults', f"{tracker.format_date(q_end)}_announcements.csv"), index=False)
         if not fetched.empty:
-            for _, row in fetched.iterrows():
-                url = row['file_url']
-                getReport(url, tracker.format_date(q_end))
+            # for _, row in fetched.iterrows():
+            #     url = row['file_url']
+            #     getReport(url, tracker.format_date(q_end))
 
-            # extracted = bot.buildNumbers(fetched)
-            # extracted.to_csv(os.path.join('QuarterlyResults', tracker.format_date(q_end)), index=False)
+            extracted = bot.buildNumbers(fetched)
+            extracted.to_csv(os.path.join('NBFC_QuarterlyResults', f"{tracker.format_date(q_end)}_numbers.csv"), index=False)
 
 
 def main():
